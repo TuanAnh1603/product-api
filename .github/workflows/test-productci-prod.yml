@@ -1,13 +1,16 @@
-
 name: Product API - Production CI and CD
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  DOCKER_IMAGE: anhtuan1603/product-api
 
 jobs:
   # ==========================================
@@ -53,11 +56,14 @@ jobs:
         run: |
           for i in $(seq 1 30); do
             if curl --fail http://127.0.0.1:3000/health; then
+              echo "API is healthy"
               exit 0
             fi
+
             sleep 2
           done
 
+          echo "API failed to start"
           cat /tmp/product-api.log
           exit 1
 
@@ -74,16 +80,21 @@ jobs:
           set -e
 
           docker network create ci-net
+
           docker run -d \
             --name ci-mongo \
             --network ci-net \
             mongo:7
 
+          echo "Waiting for MongoDB..."
+
           for i in $(seq 1 30); do
             if docker exec ci-mongo \
               mongosh --quiet --eval 'db.adminCommand("ping").ok'; then
+              echo "MongoDB is ready"
               break
             fi
+
             sleep 2
           done
 
@@ -94,9 +105,14 @@ jobs:
             -p 3001:3000 \
             product-api:ci
 
+          echo "Waiting for Product API..."
+
           for i in $(seq 1 30); do
             status=$(docker inspect \
-              --format='{{.State.Health.Status}}' ci-api 2>/dev/null || true)
+              --format='{{.State.Health.Status}}' \
+              ci-api 2>/dev/null || true)
+
+            echo "Health status: $status"
 
             if [ "$status" = "healthy" ]; then
               echo "Product API is healthy"
@@ -120,24 +136,31 @@ jobs:
           docker rm -f ci-api ci-mongo 2>/dev/null || true
           docker network rm ci-net 2>/dev/null || true
 
+
   # ==========================================
   # JOB 2: BUILD AND PUSH TO DOCKER HUB
   # ==========================================
   publish:
     name: Build and Push to Docker Hub
     needs: integration-test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
 
+      # FIXED
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -148,8 +171,9 @@ jobs:
           context: .
           push: true
           tags: |
-            anhtuan1603/product-api:latest
-            anhtuan1603/product-api:${{ github.sha }}
+            ${{ env.DOCKER_IMAGE }}:latest
+            ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+
 
   # ==========================================
   # JOB 3: DEPLOY TO LOCAL DOCKER ENGINE
@@ -157,40 +181,46 @@ jobs:
   deploy-local:
     name: Deploy to Local Docker Engine
     needs: publish
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
-    runs-on: [self-hosted, product-api-local]
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+
+    runs-on:
+      - self-hosted
+      - product-api-local
 
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
 
+      # FIXED
       - name: Login to Docker Hub
-        env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull production image
         shell: pwsh
-        run: |
-          $env:DOCKER_PASSWORD | docker login `
-            --username $env:DOCKER_USERNAME `
-            --password-stdin
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Docker Hub login failed"
-          }
-
-      - name: Pull and deploy image
         env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           IMAGE_TAG: ${{ github.sha }}
-        shell: pwsh
         run: |
-          docker compose -f docker-compose-prod.yaml pull
+          Write-Host "Pulling image:"
+          Write-Host "${{ env.DOCKER_IMAGE }}:$env:IMAGE_TAG"
+
+          docker pull "${{ env.DOCKER_IMAGE }}:$env:IMAGE_TAG"
 
           if ($LASTEXITCODE -ne 0) {
             throw "Docker image pull failed"
           }
 
+      - name: Deploy with Docker Compose
+        shell: pwsh
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
           docker compose -f docker-compose-prod.yaml up -d --remove-orphans
 
           if ($LASTEXITCODE -ne 0) {
@@ -202,10 +232,15 @@ jobs:
         run: |
           $healthy = $false
 
+          Write-Host "Waiting for Product API to become healthy..."
+
           for ($i = 0; $i -lt 30; $i++) {
+
             $status = docker inspect `
               --format='{{.State.Health.Status}}' `
               product-api-prod-container 2>$null
+
+            Write-Host "Health status: $status"
 
             if ($status -eq "healthy") {
               Write-Host "Product API is healthy"
@@ -214,6 +249,7 @@ jobs:
             }
 
             if ($status -eq "unhealthy") {
+              Write-Host "Product API is unhealthy"
               docker logs product-api-prod-container
               throw "Product API is unhealthy"
             }
