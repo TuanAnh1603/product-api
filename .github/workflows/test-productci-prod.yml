@@ -33,18 +33,30 @@ jobs:
           --health-start-period 15s
 
     steps:
+      # ------------------------------------------
+      # Checkout
+      # ------------------------------------------
       - name: Checkout source code
         uses: actions/checkout@v4
 
+      # ------------------------------------------
+      # Node.js
+      # ------------------------------------------
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
 
+      # ------------------------------------------
+      # Install dependencies
+      # ------------------------------------------
       - name: Install dependencies
         run: npm ci
 
+      # ------------------------------------------
+      # Start API
+      # ------------------------------------------
       - name: Start production API
         env:
           PORT: 3000
@@ -52,35 +64,58 @@ jobs:
         run: |
           nohup npm start >/tmp/product-api.log 2>&1 &
 
+      # ------------------------------------------
+      # Wait for API
+      # ------------------------------------------
       - name: Wait for API healthcheck
         run: |
+          echo "Waiting for API..."
+
           for i in $(seq 1 30); do
             if curl --fail http://127.0.0.1:3000/health; then
+              echo ""
               echo "API is healthy"
               exit 0
             fi
 
+            echo "Attempt $i/30 failed"
             sleep 2
           done
 
           echo "API failed to start"
+          echo "========== API LOG =========="
           cat /tmp/product-api.log
+          echo "============================="
           exit 1
 
+      # ------------------------------------------
+      # Integration tests
+      # ------------------------------------------
       - name: Run CRUD integration tests
         env:
           API_URL: http://127.0.0.1:3000
         run: npm test
 
+      # ------------------------------------------
+      # Build Docker image
+      # ------------------------------------------
       - name: Build Docker image for testing
-        run: docker build -t product-api:ci .
+        run: |
+          docker build \
+            -t product-api:ci \
+            .
 
+      # ------------------------------------------
+      # Test Docker container
+      # ------------------------------------------
       - name: Verify Docker container healthcheck
         run: |
           set -e
 
+          echo "Creating Docker network..."
           docker network create ci-net
 
+          echo "Starting MongoDB..."
           docker run -d \
             --name ci-mongo \
             --network ci-net \
@@ -88,19 +123,34 @@ jobs:
 
           echo "Waiting for MongoDB..."
 
+          mongo_ready=false
+
           for i in $(seq 1 30); do
             if docker exec ci-mongo \
-              mongosh --quiet --eval 'db.adminCommand("ping").ok'; then
+              mongosh --quiet --eval 'db.adminCommand("ping").ok' | grep -q "1"; then
+
               echo "MongoDB is ready"
+              mongo_ready=true
               break
             fi
 
+            echo "MongoDB attempt $i/30"
             sleep 2
           done
+
+          if [ "$mongo_ready" != "true" ]; then
+            echo "MongoDB failed to start"
+            docker logs ci-mongo
+            exit 1
+          fi
+
+          echo "Starting Product API..."
 
           docker run -d \
             --name ci-api \
             --network ci-net \
+            -e NODE_ENV=production \
+            -e PORT=3000 \
             -e MONGO_URI=mongodb://ci-mongo:27017/productdb \
             -p 3001:3000 \
             product-api:ci
@@ -120,6 +170,7 @@ jobs:
             fi
 
             if [ "$status" = "unhealthy" ]; then
+              echo "Product API is unhealthy"
               docker logs ci-api
               exit 1
             fi
@@ -127,9 +178,13 @@ jobs:
             sleep 2
           done
 
+          echo "Product API healthcheck timed out"
           docker logs ci-api
           exit 1
 
+      # ------------------------------------------
+      # Cleanup
+      # ------------------------------------------
       - name: Cleanup test containers
         if: always()
         run: |
@@ -151,10 +206,40 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ------------------------------------------
+      # Checkout
+      # ------------------------------------------
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      # FIXED
+      # ------------------------------------------
+      # CHECK DOCKER HUB SECRETS
+      # ------------------------------------------
+      - name: Check Docker Hub secrets
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo "Checking Docker Hub credentials..."
+
+          if [ -z "$DOCKERHUB_USERNAME" ]; then
+            echo "ERROR: DOCKERHUB_USERNAME is empty"
+            echo "Please check GitHub Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+
+          if [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "ERROR: DOCKERHUB_TOKEN is empty"
+            echo "Please check GitHub Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+
+          echo "Docker Hub credentials are available"
+
+      # ------------------------------------------
+      # Login Docker Hub
+      # ------------------------------------------
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -162,9 +247,15 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # ------------------------------------------
+      # Setup Buildx
+      # ------------------------------------------
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # ------------------------------------------
+      # Build and Push
+      # ------------------------------------------
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -173,6 +264,15 @@ jobs:
           tags: |
             ${{ env.DOCKER_IMAGE }}:latest
             ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+
+      # ------------------------------------------
+      # Show pushed image
+      # ------------------------------------------
+      - name: Show Docker image
+        run: |
+          echo "Docker image pushed successfully:"
+          echo "${{ env.DOCKER_IMAGE }}:latest"
+          echo "${{ env.DOCKER_IMAGE }}:${{ github.sha }}"
 
 
   # ==========================================
@@ -191,10 +291,35 @@ jobs:
       - product-api-local
 
     steps:
+      # ------------------------------------------
+      # Checkout
+      # ------------------------------------------
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      # FIXED
+      # ------------------------------------------
+      # CHECK DOCKER
+      # ------------------------------------------
+      - name: Check Docker environment
+        shell: pwsh
+        run: |
+          Write-Host "Checking Docker..."
+
+          docker --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Docker is not available"
+          }
+
+          docker compose version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Docker Compose is not available"
+          }
+
+      # ------------------------------------------
+      # Login Docker Hub
+      # ------------------------------------------
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -202,31 +327,59 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # ------------------------------------------
+      # Pull exact image
+      # ------------------------------------------
       - name: Pull production image
         shell: pwsh
         env:
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          Write-Host "Pulling image:"
-          Write-Host "${{ env.DOCKER_IMAGE }}:$env:IMAGE_TAG"
+          $image = "${{ env.DOCKER_IMAGE }}:$env:IMAGE_TAG"
 
-          docker pull "${{ env.DOCKER_IMAGE }}:$env:IMAGE_TAG"
+          Write-Host "Pulling image:"
+          Write-Host $image
+
+          docker pull $image
 
           if ($LASTEXITCODE -ne 0) {
             throw "Docker image pull failed"
           }
 
+          Write-Host "Docker image pulled successfully"
+
+      # ------------------------------------------
+      # Deploy
+      # ------------------------------------------
       - name: Deploy with Docker Compose
         shell: pwsh
         env:
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker compose -f docker-compose-prod.yaml up -d --remove-orphans
+          Write-Host "Starting Docker Compose deployment..."
+
+          docker compose `
+            -f docker-compose-prod.yaml `
+            up -d `
+            --remove-orphans
 
           if ($LASTEXITCODE -ne 0) {
             throw "Docker Compose deployment failed"
           }
 
+          Write-Host "Docker Compose deployment successful"
+
+      # ------------------------------------------
+      # Show containers
+      # ------------------------------------------
+      - name: Show running containers
+        shell: pwsh
+        run: |
+          docker ps
+
+      # ------------------------------------------
+      # Verify API health
+      # ------------------------------------------
       - name: Verify deployed API health
         shell: pwsh
         run: |
@@ -240,7 +393,7 @@ jobs:
               --format='{{.State.Health.Status}}' `
               product-api-prod-container 2>$null
 
-            Write-Host "Health status: $status"
+            Write-Host "Attempt $($i + 1)/30 - Health status: $status"
 
             if ($status -eq "healthy") {
               Write-Host "Product API is healthy"
@@ -250,7 +403,9 @@ jobs:
 
             if ($status -eq "unhealthy") {
               Write-Host "Product API is unhealthy"
+              Write-Host "========== CONTAINER LOG =========="
               docker logs product-api-prod-container
+              Write-Host "==================================="
               throw "Product API is unhealthy"
             }
 
@@ -258,10 +413,16 @@ jobs:
           }
 
           if (-not $healthy) {
+            Write-Host "Product API healthcheck timed out"
+            Write-Host "========== CONTAINER LOG =========="
             docker logs product-api-prod-container
+            Write-Host "==================================="
             throw "Product API healthcheck timed out"
           }
 
+      # ------------------------------------------
+      # Logout
+      # ------------------------------------------
       - name: Logout from Docker Hub
         if: always()
         shell: pwsh
